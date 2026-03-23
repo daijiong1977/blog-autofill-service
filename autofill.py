@@ -1,13 +1,13 @@
 """
-autofill.py — Core blog generation logic.
+autofill.py — Core blog autofill logic.
 
 Reads config from environment variables:
-  SUPABASE_URL               e.g. https://xxx.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY  service role JWT
-  DEEPSEEK_API_KEY           sk-...
+    SUPABASE_URL               e.g. https://xxx.supabase.co
+    SUPABASE_SERVICE_ROLE_KEY  service role JWT
+    DEEPSEEK_API_KEY           sk-...
 
-Call run_autofill_en() → generate English posts and insert them into Supabase.
-Call run_autofill_cn() → translate existing English posts and update CN fields separately.
+Primary flow: translate existing English posts and update CN fields separately.
+English generation remains available in code for explicit manual use only.
 """
 
 import json, urllib.request, urllib.error, urllib.parse
@@ -113,10 +113,46 @@ def call_llm(prompt, max_tokens=1800, system_prompt=None, temperature=0.7):
         result = json.loads(resp.read())
     return result["choices"][0]["message"]["content"]
 
+def _strip_json_fences(raw):
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return raw.strip()
+
+def _extract_json_object(raw):
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return raw[start:end + 1]
+    return raw
+
+def _escape_invalid_backslashes(raw):
+    return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+
+def _drop_bad_control_chars(raw):
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw)
+
+def _drop_trailing_commas(raw):
+    return re.sub(r",\s*([}\]])", r"\1", raw)
+
+def repair_llm_json(raw):
+    candidate = _extract_json_object(_strip_json_fences(raw))
+    candidate = candidate.replace("\r\n", "\n").replace("\r", "\n")
+    candidate = _drop_bad_control_chars(candidate)
+    candidate = _escape_invalid_backslashes(candidate)
+    candidate = _drop_trailing_commas(candidate)
+    return candidate
+
 def parse_llm_json(raw):
-    raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$", "", raw.strip())
-    return json.loads(raw)
+    cleaned = _extract_json_object(_strip_json_fences(raw))
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        repaired = repair_llm_json(raw)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Unable to parse LLM JSON after repair: {exc}") from exc
 
 def generate_post(topic, cfg, articles):
     sources_text = "\n".join(
@@ -287,7 +323,7 @@ def insert_post(data, cn_data=None):
         json.loads(resp.read())
     return slug
 
-def fetch_posts_missing_cn(limit=6):
+def fetch_posts_missing_cn(limit=3):
     query = urllib.parse.urlencode({
         "select": "id,slug,title,description,content",
         "published": "eq.true",
@@ -343,7 +379,7 @@ def run_autofill_en():
 
     return {"created": results, "errors": errors}
 
-def run_autofill_cn(limit=6):
+def run_autofill_cn(limit=3, batch_size=3, batch_pause_seconds=2):
     """Translate existing English posts into Chinese and update CN fields only."""
     results = []
     errors = []
@@ -353,23 +389,43 @@ def run_autofill_cn(limit=6):
     except Exception as e:
         return {"translated": [], "errors": [{"scope": "fetch_posts_missing_cn", "error": str(e)}]}
 
-    for post in posts:
-        try:
-            print(f"[run_cn] translating slug={post['slug']}", flush=True)
-            cn_data = generate_cn_translation(
-                post["title"],
-                post["description"],
-                post["content"],
-            )
-            update_post_cn(post["id"], cn_data)
-            results.append({
-                "id": post["id"],
-                "slug": post["slug"],
-                "title": post["title"],
-                "admin_url": f"{ADMIN_BASE}/admin/posts/{post['slug']}",
-            })
-            time.sleep(1)
-        except Exception as e:
-            errors.append({"slug": post.get("slug", "unknown"), "error": str(e)})
+    batch_size = max(1, batch_size)
+    total_batches = (len(posts) + batch_size - 1) // batch_size
 
-    return {"translated": results, "errors": errors}
+    for batch_index in range(total_batches):
+        batch = posts[batch_index * batch_size : (batch_index + 1) * batch_size]
+        print(f"[run_cn] batch={batch_index + 1}/{total_batches} size={len(batch)}", flush=True)
+
+        for post in batch:
+            try:
+                print(f"[run_cn] translating slug={post['slug']}", flush=True)
+                cn_data = generate_cn_translation(
+                    post["title"],
+                    post["description"],
+                    post["content"],
+                )
+                update_post_cn(post["id"], cn_data)
+                results.append({
+                    "id": post["id"],
+                    "slug": post["slug"],
+                    "title": post["title"],
+                    "batch": batch_index + 1,
+                    "admin_url": f"{ADMIN_BASE}/admin/posts/{post['slug']}",
+                })
+                time.sleep(1)
+            except Exception as e:
+                errors.append({
+                    "slug": post.get("slug", "unknown"),
+                    "batch": batch_index + 1,
+                    "error": str(e),
+                })
+
+        if batch_index + 1 < total_batches:
+            time.sleep(batch_pause_seconds)
+
+    return {
+        "translated": results,
+        "errors": errors,
+        "batches": total_batches,
+        "batch_size": batch_size,
+    }
