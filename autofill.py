@@ -6,7 +6,8 @@ Reads config from environment variables:
   SUPABASE_SERVICE_ROLE_KEY  service role JWT
   DEEPSEEK_API_KEY           sk-...
 
-Call run_autofill() → returns list of {topic, title, slug, admin_url}
+Call run_autofill_en() → generate English posts and insert them into Supabase.
+Call run_autofill_cn() → translate existing English posts and update CN fields separately.
 """
 
 import json, urllib.request, urllib.error, urllib.parse
@@ -249,7 +250,7 @@ def slug_exists(slug):
     with urllib.request.urlopen(req) as resp:
         return len(json.loads(resp.read())) > 0
 
-def insert_post(data, cn_data):
+def insert_post(data, cn_data=None):
     slug = slugify(data["title"])
     base_slug, suffix = slug, 1
     while True:
@@ -260,6 +261,8 @@ def insert_post(data, cn_data):
             break
         slug = f"{base_slug}-{suffix}"
         suffix += 1
+
+    cn_data = cn_data or {}
 
     payload = {
         "slug":           slug,
@@ -284,9 +287,38 @@ def insert_post(data, cn_data):
         json.loads(resp.read())
     return slug
 
+def fetch_posts_missing_cn(limit=6):
+    query = urllib.parse.urlencode({
+        "select": "id,slug,title,description,content",
+        "published": "eq.true",
+        "or": "(content_cn.is.null,content_cn.eq.)",
+        "order": "date.desc",
+        "limit": str(limit),
+    })
+    url = f"{SUPABASE_URL}/rest/v1/posts?{query}"
+    req = urllib.request.Request(url, headers=SUPA_HEADERS)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+def update_post_cn(post_id, cn_data):
+    payload = {
+        "title_cn": cn_data.get("title_cn", ""),
+        "description_cn": cn_data.get("description_cn", "")[:200],
+        "content_cn": cn_data.get("content_cn", ""),
+    }
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/posts?id=eq.{urllib.parse.quote(str(post_id))}",
+        data=body,
+        headers={**SUPA_HEADERS, "Prefer": "return=minimal"},
+        method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=20):
+        return None
+
 # ── Main entry point ──────────────────────────────────────────────────────────
-def run_autofill():
-    """Generate 6 draft blog posts and insert into Supabase. Returns results list."""
+def run_autofill_en():
+    """Generate English blog posts and insert them into Supabase."""
     results = []
     errors  = []
 
@@ -296,13 +328,9 @@ def run_autofill():
         for i in range(cfg["count"]):
             subset = articles[i * 3 : (i * 3) + 3]
             try:
+                print(f"[run_en] generating topic={topic} batch={i+1}", flush=True)
                 post_data = generate_post(topic, cfg, subset)
-                cn_data = generate_cn_translation(
-                    post_data["title"],
-                    post_data["description"],
-                    post_data["content"],
-                )
-                slug = insert_post(post_data, cn_data)
+                slug = insert_post(post_data)
                 results.append({
                     "topic":     topic,
                     "title":     post_data["title"],
@@ -314,3 +342,34 @@ def run_autofill():
                 errors.append({"topic": topic, "error": str(e)})
 
     return {"created": results, "errors": errors}
+
+def run_autofill_cn(limit=6):
+    """Translate existing English posts into Chinese and update CN fields only."""
+    results = []
+    errors = []
+
+    try:
+        posts = fetch_posts_missing_cn(limit=limit)
+    except Exception as e:
+        return {"translated": [], "errors": [{"scope": "fetch_posts_missing_cn", "error": str(e)}]}
+
+    for post in posts:
+        try:
+            print(f"[run_cn] translating slug={post['slug']}", flush=True)
+            cn_data = generate_cn_translation(
+                post["title"],
+                post["description"],
+                post["content"],
+            )
+            update_post_cn(post["id"], cn_data)
+            results.append({
+                "id": post["id"],
+                "slug": post["slug"],
+                "title": post["title"],
+                "admin_url": f"{ADMIN_BASE}/admin/posts/{post['slug']}",
+            })
+            time.sleep(1)
+        except Exception as e:
+            errors.append({"slug": post.get("slug", "unknown"), "error": str(e)})
+
+    return {"translated": results, "errors": errors}
