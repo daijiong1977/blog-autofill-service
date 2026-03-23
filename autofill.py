@@ -139,6 +139,27 @@ Respond ONLY with valid JSON (no markdown fences), exactly this shape:
     raw = re.sub(r"\n?```$", "", raw.strip())
     return json.loads(raw)
 
+def generate_cn_translation(title, description, content):
+    prompt = f"""请将以下英文博客文章翻译成地道的中文（简体）。保持原有的语气和风格，专业术语可保留英文或标注中文。
+
+英文标题：{title}
+
+英文摘要：{description}
+
+英文正文（段落以空行分隔）：
+{content}
+
+请以JSON格式返回（不要加markdown代码块），格式如下：
+{{
+  "title_cn": "中文标题",
+  "description_cn": "中文摘要（不超过200字）",
+  "content_cn": "中文正文段落1\\n\\n中文正文段落2\\n\\n..."
+}}"""
+    raw = call_llm(prompt, max_tokens=2500)
+    raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
+    raw = re.sub(r"\n?```$", "", raw.strip())
+    return json.loads(raw)
+
 # ── Supabase helpers ──────────────────────────────────────────────────────────
 SUPA_HEADERS = {
     "apikey":        SERVICE_KEY,
@@ -160,7 +181,7 @@ def slug_exists(slug):
     with urllib.request.urlopen(req) as resp:
         return len(json.loads(resp.read())) > 0
 
-def insert_post(data):
+def insert_post(data, cn_data):
     slug = slugify(data["title"])
     base_slug, suffix = slug, 1
     while True:
@@ -173,14 +194,17 @@ def insert_post(data):
         suffix += 1
 
     payload = {
-        "slug":         slug,
-        "title":        data["title"],
-        "description":  data["description"][:200],
-        "content":      data["content"],
-        "tags":         data.get("tags", []),
-        "date":         datetime.date.today().isoformat(),
-        "reading_time": data.get("reading_time", "5 min read"),
-        "published":    False,
+        "slug":           slug,
+        "title":          data["title"],
+        "title_cn":       cn_data.get("title_cn", ""),
+        "description":    data["description"][:200],
+        "description_cn": cn_data.get("description_cn", "")[:200],
+        "content":        data["content"],
+        "content_cn":     cn_data.get("content_cn", ""),
+        "tags":           data.get("tags", []),
+        "date":           datetime.date.today().isoformat(),
+        "reading_time":   data.get("reading_time", "5 min read"),
+        "published":      True,
     }
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -205,7 +229,12 @@ def run_autofill():
             subset = articles[i * 3 : (i * 3) + 3]
             try:
                 post_data = generate_post(topic, cfg, subset)
-                slug = insert_post(post_data)
+                cn_data = generate_cn_translation(
+                    post_data["title"],
+                    post_data["description"],
+                    post_data["content"],
+                )
+                slug = insert_post(post_data, cn_data)
                 results.append({
                     "topic":     topic,
                     "title":     post_data["title"],
