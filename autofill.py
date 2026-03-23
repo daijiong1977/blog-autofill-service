@@ -88,11 +88,17 @@ def gather_sources(topic):
     return articles[:6]
 
 # ── DeepSeek (OpenAI-compatible) ─────────────────────────────────────────────
-def call_llm(prompt, max_tokens=1800):
+def call_llm(prompt, max_tokens=1800, system_prompt=None, temperature=0.7):
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     body = json.dumps({
         "model": "deepseek-chat",
         "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "messages": messages,
     }).encode()
     req = urllib.request.Request(
         "https://api.deepseek.com/chat/completions",
@@ -105,6 +111,11 @@ def call_llm(prompt, max_tokens=1800):
     with urllib.request.urlopen(req, timeout=90) as resp:
         result = json.loads(resp.read())
     return result["choices"][0]["message"]["content"]
+
+def parse_llm_json(raw):
+    raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
+    raw = re.sub(r"\n?```$", "", raw.strip())
+    return json.loads(raw)
 
 def generate_post(topic, cfg, articles):
     sources_text = "\n".join(
@@ -135,12 +146,24 @@ Respond ONLY with valid JSON (no markdown fences), exactly this shape:
 }}"""
 
     raw = call_llm(prompt)
-    raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$", "", raw.strip())
-    return json.loads(raw)
+    return parse_llm_json(raw)
 
 def generate_cn_translation(title, description, content):
-    prompt = f"""请将以下英文博客文章翻译成地道的中文（简体）。保持原有的语气和风格，专业术语可保留英文或标注中文。
+    translator_system = """你是一位中英双语的技术专栏编辑，擅长把英文技术评论文章改写成自然、锋利、有网感的简体中文。
+
+你的目标不是逐句直译，而是在不歪曲原意的前提下，写出像中文母语作者亲自写的文章。
+
+必须遵守：
+- 保留原文的核心观点、论证顺序、语气强度与具体细节。
+- 不要出现翻译腔，不要机械照搬英文句法。
+- 标题要像中文技术评论文章标题，准确、自然、有张力，不要硬译。
+- 正文按原文段落对应输出，段落数尽量一致。
+- 人名、公司名、产品名、协议名、框架名保留英文；必要时可在首次出现时补简短中文说明。
+- 专业术语优先使用中文技术社区常见说法；若直译生硬，则保留英文。
+- 避免空话、套话和机器翻译常见连接词，如“值得注意的是”“与此同时”“总而言之”，除非语义上确实需要。
+- 可以润色句子让中文更顺，但不能删掉关键论点，也不能加入原文没有的新观点。"""
+
+    first_pass_prompt = f"""请将以下英文博客文章改写为高质量的简体中文技术评论文章。
 
 英文标题：{title}
 
@@ -155,10 +178,55 @@ def generate_cn_translation(title, description, content):
   "description_cn": "中文摘要（不超过200字）",
   "content_cn": "中文正文段落1\\n\\n中文正文段落2\\n\\n..."
 }}"""
-    raw = call_llm(prompt, max_tokens=2500)
-    raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$", "", raw.strip())
-    return json.loads(raw)
+
+    first_pass = parse_llm_json(call_llm(
+        first_pass_prompt,
+        max_tokens=2500,
+        system_prompt=translator_system,
+        temperature=0.4,
+    ))
+
+    polish_prompt = f"""下面有一篇英文原文，以及一版已经翻成中文的初稿。请你作为中文母语技术编辑，对中文初稿做二次润色。
+
+润色目标：
+- 消除翻译腔，让表达更像中文作者直接写作。
+- 保留原文的观点、事实、论证关系和语气，不要漏信息，不要擅自发挥。
+- 让标题更自然，摘要更凝练，正文更顺畅。
+- 保持段落结构清晰，仍然输出为普通段落文本。
+
+英文标题：{title}
+
+英文摘要：{description}
+
+英文正文：
+{content}
+
+中文初稿标题：{first_pass.get('title_cn', '')}
+
+中文初稿摘要：{first_pass.get('description_cn', '')}
+
+中文初稿正文：
+{first_pass.get('content_cn', '')}
+
+请输出最终润色后的JSON（不要加markdown代码块），格式如下：
+{{
+  "title_cn": "中文标题",
+  "description_cn": "中文摘要（不超过200字）",
+  "content_cn": "中文正文段落1\\n\\n中文正文段落2\\n\\n..."
+}}"""
+
+    polished = parse_llm_json(call_llm(
+        polish_prompt,
+        max_tokens=2800,
+        system_prompt=translator_system,
+        temperature=0.3,
+    ))
+
+    return {
+        "title_cn": polished.get("title_cn", first_pass.get("title_cn", "")),
+        "description_cn": polished.get("description_cn", first_pass.get("description_cn", "")),
+        "content_cn": polished.get("content_cn", first_pass.get("content_cn", "")),
+    }
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
 SUPA_HEADERS = {
